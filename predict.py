@@ -1,9 +1,10 @@
 """
 predict.py — LeafScan AI Inference Pipeline
-Robust version for Streamlit Cloud deployment
+Final robust version for Streamlit Cloud
 """
 
 import os
+import subprocess
 import requests
 import numpy as np
 from collections import OrderedDict
@@ -51,7 +52,7 @@ LABELS = {
     "pest": ["healthy", "mild_damage", "severe_damage"],
 }
 
-# ── Recommended actions ─────────────────────────────────────────────────────
+# ── Actions ─────────────────────────────────────────────────────────────────
 ACTIONS = {
     "dryness": {
         "healthy": "No action needed. Continue your normal watering schedule.",
@@ -84,11 +85,10 @@ _PREPROCESS = transforms.Compose([
     ),
 ])
 
-# ── Cache ───────────────────────────────────────────────────────────────────
 _model_cache = {}
 
 
-def _is_probably_html(file_path: str, n_bytes: int = 512) -> bool:
+def _is_probably_html(file_path: str, n_bytes: int = 1024) -> bool:
     try:
         with open(file_path, "rb") as f:
             head = f.read(n_bytes).lower()
@@ -97,14 +97,59 @@ def _is_probably_html(file_path: str, n_bytes: int = 512) -> bool:
             or b"<!doctype html" in head
             or b"<head" in head
             or b"<body" in head
+            or b"google drive" in head
         )
     except Exception:
         return False
 
 
-def _download_file_from_gdrive(file_id: str, dest_path: str) -> None:
+def _validate_checkpoint_file(file_path: str) -> None:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Missing file: {file_path}")
+
+    size_mb = os.path.getsize(file_path) / 1e6
+    print(f"Validated file {os.path.basename(file_path)} size: {size_mb:.2f} MB")
+
+    if size_mb < 0.1:
+        raise ValueError(
+            f"{os.path.basename(file_path)} is too small ({size_mb:.2f} MB). "
+            "Likely not a real checkpoint."
+        )
+
+    if _is_probably_html(file_path):
+        with open(file_path, "rb") as f:
+            preview = f.read(300).decode("utf-8", errors="ignore")
+        raise ValueError(
+            f"{os.path.basename(file_path)} looks like HTML instead of a .pth file. "
+            f"Preview: {preview}"
+        )
+
+
+def _download_with_gdown(file_id: str, dest_path: str) -> bool:
+    url = f"https://drive.google.com/uc?id={file_id}"
+    try:
+        subprocess.run(
+            ["python", "-m", "pip", "install", "gdown", "-q"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = subprocess.run(
+            ["gdown", "--fuzzy", url, "-O", dest_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        print(result.stdout)
+        return True
+    except Exception as e:
+        print(f"gdown download failed for {os.path.basename(dest_path)}: {e}")
+        return False
+
+
+def _download_with_requests(file_id: str, dest_path: str) -> None:
     session = requests.Session()
-    url = "https://drive.google.com/uc?export=download"
+    url = "https://docs.google.com/uc?export=download"
 
     response = session.get(url, params={"id": file_id}, stream=True)
     token = None
@@ -123,28 +168,20 @@ def _download_file_from_gdrive(file_id: str, dest_path: str) -> None:
 
     response.raise_for_status()
 
-    content_type = response.headers.get("Content-Type", "")
-    print(f"Downloading {os.path.basename(dest_path)} | content-type={content_type}")
-
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
 
-    size_mb = os.path.getsize(dest_path) / 1e6
-    print(f"Saved {os.path.basename(dest_path)} ({size_mb:.2f} MB)")
 
-    if size_mb < 0.1 or _is_probably_html(dest_path):
-        try:
-            with open(dest_path, "rb") as f:
-                preview = f.read(200).decode("utf-8", errors="ignore")
-        except Exception:
-            preview = "Could not read preview"
+def _download_file_from_gdrive(file_id: str, dest_path: str) -> None:
+    ok = _download_with_gdown(file_id, dest_path)
 
-        raise ValueError(
-            f"Downloaded file {os.path.basename(dest_path)} does not look like a valid PyTorch checkpoint. "
-            f"Preview: {preview}"
-        )
+    if not ok or not os.path.exists(dest_path):
+        print(f"Falling back to requests for {os.path.basename(dest_path)}")
+        _download_with_requests(file_id, dest_path)
+
+    _validate_checkpoint_file(dest_path)
 
 
 def _download_models_if_missing() -> None:
@@ -152,46 +189,32 @@ def _download_models_if_missing() -> None:
 
     for filename, file_id in _GDRIVE_IDS.items():
         local_path = os.path.join(MODEL_DIR, filename)
-        if not os.path.exists(local_path):
-            print(f"Missing {filename} — downloading...")
-            _download_file_from_gdrive(file_id, local_path)
-        else:
-            size_mb = os.path.getsize(local_path) / 1e6
-            print(f"Found {filename} ({size_mb:.2f} MB)")
 
-            if size_mb < 0.1 or _is_probably_html(local_path):
-                print(f"{filename} looks corrupted or invalid. Re-downloading...")
+        if os.path.exists(local_path):
+            try:
+                _validate_checkpoint_file(local_path)
+                print(f"Found valid {filename}")
+                continue
+            except Exception as e:
+                print(f"Existing {filename} is invalid: {e}")
                 try:
                     os.remove(local_path)
                 except Exception:
                     pass
-                _download_file_from_gdrive(file_id, local_path)
+
+        print(f"Downloading {filename}...")
+        _download_file_from_gdrive(file_id, local_path)
 
 
 def _safe_torch_load(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
-
-    size_mb = os.path.getsize(path) / 1e6
-    print(f"Loading checkpoint: {path} ({size_mb:.2f} MB)")
-
-    if size_mb < 0.1:
-        raise ValueError(
-            f"Checkpoint is too small ({size_mb:.2f} MB). "
-            "It may be an HTML/text error page instead of a real .pth file."
-        )
-
-    if _is_probably_html(path):
-        raise ValueError(
-            f"Checkpoint {os.path.basename(path)} appears to be HTML, not a PyTorch model file."
-        )
+    _validate_checkpoint_file(path)
 
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
     except Exception as e1:
-        print(f"torch.load(weights_only=False) failed: {e1}")
+        print(f"First torch.load failed for {os.path.basename(path)}: {e1}")
         try:
             return torch.load(path, map_location="cpu")
         except Exception as e2:
@@ -215,7 +238,6 @@ def _extract_state_dict(ckpt):
     for k, v in ckpt.items():
         new_key = k.replace("module.", "").replace("_orig_mod.", "")
         cleaned[new_key] = v
-
     return cleaned
 
 
@@ -327,11 +349,7 @@ def _stage4_pest(tensor: torch.Tensor) -> dict:
 
 
 def run_pipeline(pil_image: Image.Image) -> dict:
-    """
-    Run the LeafScan pipeline. Stage 1 is bypassed, so every image is treated as a valid leaf.
-    """
     tensor = _preprocess(pil_image)
-
     return {
         "is_valid_leaf": True,
         "leaf_confidence": 1.0,
@@ -341,5 +359,4 @@ def run_pipeline(pil_image: Image.Image) -> dict:
     }
 
 
-# Download checkpoints once at import time
 _download_models_if_missing()
