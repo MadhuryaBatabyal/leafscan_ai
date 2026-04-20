@@ -31,8 +31,8 @@ except ImportError:
 # Map each local path → Google Drive file ID
 _GDRIVE_IDS = {
     "models/stage2_dryness.pth": "1qaziTwtPpD7F2d-kqcDlddzTXo_qvCAu",
-    "models/stage3_disease.pth": "1VB1bOLAtI295NQ8N9cGWsdbhCw7E-ujE",
-    "models/stage4_pest.pth":    "1_6LxyzCFY_W_GBb8iXy_Xq_vlT1VBBox",
+    "models/stage3_disease.pth": "1_6LxyzCFY_W_GBb8iXy_Xq_vlT1VBBox",
+    "models/stage4_pest.pth":    "1VB1bOLAtI295NQ8N9cGWsdbhCw7E-ujE",
 }
 
 def _download_models_if_missing():
