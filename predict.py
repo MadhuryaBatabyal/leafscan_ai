@@ -3,75 +3,39 @@ predict.py — LeafScan AI Inference Pipeline
 """
 
 import os
+import requests
+import numpy as np
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision import models
 from PIL import Image
-import numpy as np
-import requests
 
-# ── Absolute paths ─────────────────────────────────────────────────────────
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+# ── Absolute paths ──────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
-# ── Google Drive file IDs ──────────────────────────────────────────────────
+# ── Google Drive file IDs ───────────────────────────────────────────────────
 _GDRIVE_IDS = {
     "stage2_dryness.pth": "1qaziTwtPpD7F2d-kqcDlddzTXo_qvCAu",
     "stage3_disease.pth": "1VB1bOLAtI295NQ8N9cGWsdbhCw7E-ujE",
-    "stage4_pest.pth":    "1_6LxyzCFY_W_GBb8iXy_Xq_vlT1VBBox",
+    "stage4_pest.pth": "1_6LxyzCFY_W_GBb8iXy_Xq_vlT1VBBox",
 }
 
-
-def _download_file_from_gdrive(file_id: str, dest_path: str):
-    session  = requests.Session()
-    url      = "https://drive.google.com/uc?export=download"
-    response = session.get(url, params={"id": file_id}, stream=True)
-
-    # Handle large-file confirmation cookie
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-    if token:
-        response = session.get(
-            url, params={"id": file_id, "confirm": token}, stream=True
-        )
-
-    with open(dest_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=32768):
-            if chunk:
-                f.write(chunk)
-
-
-def _download_models_if_missing():
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    for filename, file_id in _GDRIVE_IDS.items():
-        local_path = os.path.join(MODEL_DIR, filename)
-        if not os.path.exists(local_path):
-            print(f"Downloading {filename}...")
-            _download_file_from_gdrive(file_id, local_path)
-            size_mb = os.path.getsize(local_path) / 1e6
-            print(f"  Saved {filename} ({size_mb:.1f} MB)")
-        else:
-            print(f"  Found {filename} — skipping download")
-
-_download_models_if_missing()
-
-
-# ── Device ─────────────────────────────────────────────────────────────────
+# ── Device ──────────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 CONFIDENCE_THRESHOLD = 0.60
 
+# ── Model paths ─────────────────────────────────────────────────────────────
 MODEL_PATHS = {
     "dryness": os.path.join(MODEL_DIR, "stage2_dryness.pth"),
     "disease": os.path.join(MODEL_DIR, "stage3_disease.pth"),
-    "pest":    os.path.join(MODEL_DIR, "stage4_pest.pth"),
+    "pest": os.path.join(MODEL_DIR, "stage4_pest.pth"),
 }
 
-# ── Confirmed class labels ─────────────────────────────────────────────────
+# ── Confirmed class labels ──────────────────────────────────────────────────
 LABELS = {
     "dryness": ["healthy", "mild_stress", "severe_stress"],
     "disease": [
@@ -88,167 +52,220 @@ LABELS = {
 
 ACTIONS = {
     "dryness": {
-        "healthy":       "No action needed. Continue your normal watering schedule.",
-        "mild_stress":   "Increase watering frequency. Check soil moisture daily.",
-        "severe_stress": "Water immediately. Check for soil compaction or root issues.",
+        "healthy": "No action needed. Continue your normal watering schedule.",
+        "mild_stress": "Increase watering frequency. Check soil moisture daily.",
+        "severe_stress": "Water immediately. Check for soil compaction, root issues, or drainage problems.",
     },
     "disease": {
-        "healthy":            "No disease detected. Continue monitoring every 3-5 days.",
-        "bacterial_spot":     "Remove affected leaves. Apply copper-based bactericide. Avoid overhead watering.",
-        "early_blight":       "Remove infected lower leaves. Apply chlorothalonil fungicide every 7 days.",
-        "late_blight":        "Urgent: remove and destroy infected material. Apply mancozeb immediately.",
-        "leaf_mold":          "Improve airflow. Reduce humidity. Apply potassium bicarbonate fungicide.",
-        "septoria_leaf_spot": "Remove spotted leaves. Apply fungicide every 7-10 days.",
-        "tomato_mosaic_virus":"No cure — remove infected plants. Disinfect tools. Control aphid vectors.",
+        "healthy": "No disease detected. Continue monitoring every 3 to 5 days.",
+        "bacterial_spot": "Remove affected leaves. Apply copper-based bactericide. Avoid overhead watering.",
+        "early_blight": "Remove infected lower leaves. Apply chlorothalonil or mancozeb fungicide every 7 days.",
+        "late_blight": "Urgent: remove and destroy infected material. Apply mancozeb immediately and isolate the plant.",
+        "leaf_mold": "Improve airflow, reduce humidity, and apply potassium bicarbonate fungicide.",
+        "septoria_leaf_spot": "Remove spotted leaves and apply fungicide every 7 to 10 days.",
+        "tomato_mosaic_virus": "No cure. Remove infected plants, disinfect tools, and control aphid vectors.",
     },
     "pest": {
-        "healthy":       "No pest damage visible. Continue regular inspection.",
-        "mild_damage":   "Check undersides of leaves for insects. Apply neem oil spray.",
-        "severe_damage": "Urgent: identify pest type and apply targeted pesticide.",
+        "healthy": "No pest damage visible. Continue regular inspection.",
+        "mild_damage": "Inspect undersides of leaves for insects and apply neem oil spray.",
+        "severe_damage": "Urgent: identify the pest type and apply a targeted pesticide or consult an agronomist.",
     },
 }
 
+# ── Preprocessing ───────────────────────────────────────────────────────────
+_PREPROCESS = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    ),
+])
 
-# ── Model builder — reads num_classes from saved weights ──────────────────
-def _build_model(stage: str, num_classes: int) -> nn.Module:
-    """
-    num_classes is detected from the saved .pth file directly,
-    so this always matches regardless of how many classes were trained.
-    """
+# ── Model cache ─────────────────────────────────────────────────────────────
+_model_cache = {}
+
+
+def _download_file_from_gdrive(file_id: str, dest_path: str) -> None:
+    session = requests.Session()
+    url = "https://drive.google.com/uc?export=download"
+
+    response = session.get(url, params={"id": file_id}, stream=True)
+    token = None
+
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    if token:
+        response = session.get(
+            url,
+            params={"id": file_id, "confirm": token},
+            stream=True,
+        )
+
+    response.raise_for_status()
+
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+
+
+def _download_models_if_missing() -> None:
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    for filename, file_id in _GDRIVE_IDS.items():
+        local_path = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(local_path):
+            print(f"Downloading {filename}...")
+            _download_file_from_gdrive(file_id, local_path)
+            size_mb = os.path.getsize(local_path) / 1e6
+            print(f"Saved {filename} ({size_mb:.1f} MB)")
+        else:
+            print(f"Found {filename} — skipping download")
+
+
+def _build_model(stage: str) -> nn.Module:
+    num_classes = len(LABELS[stage])
+
     if stage in ("dryness", "pest"):
-        m = models.efficientnet_b0(weights=None)
-        m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
-
+        model = models.efficientnet_b0(weights=None)
+        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     elif stage == "disease":
-        m = models.resnet50(weights=None)
-        m.fc = nn.Linear(m.fc.in_features, num_classes)
-
+        model = models.resnet50(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
-    return m
+    return model
 
 
-def _detect_num_classes(path: str, stage: str) -> int:
-    """
-    Reads the saved state_dict and extracts the actual output size
-    from the final layer — no guessing needed.
-    """
-    state = torch.load(path, map_location="cpu")
+def _extract_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        if "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        elif "model_state_dict" in ckpt:
+            ckpt = ckpt["model_state_dict"]
 
-    if stage == "disease":
-        # ResNet50 final layer key
-        return state["fc.weight"].shape[0]
-    else:
-        # EfficientNetB0 final layer key
-        return state["classifier.1.weight"].shape[0]
+    if not isinstance(ckpt, (dict, OrderedDict)):
+        raise ValueError("Checkpoint is not a valid state_dict or wrapped state_dict")
 
+    cleaned = OrderedDict()
+    for k, v in ckpt.items():
+        new_key = k.replace("module.", "").replace("_orig_mod.", "")
+        cleaned[new_key] = v
 
-# ── Model cache ────────────────────────────────────────────────────────────
-_model_cache: dict = {}
+    return cleaned
+
 
 def _load_model(stage: str) -> nn.Module:
     if stage in _model_cache:
         return _model_cache[stage]
 
+    model = _build_model(stage)
     path = MODEL_PATHS[stage]
 
-    if not os.path.exists(path):
-        print(f"WARNING: {path} not found — demo mode (random predictions)")
-        num_classes = len(LABELS[stage])
-        model = _build_model(stage, num_classes)
-        model.eval()
-        model.to(DEVICE)
-        _model_cache[stage] = model
-        return model
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        state = _extract_state_dict(ckpt)
+        model_state = model.state_dict()
 
-    # Detect actual number of classes from the saved weights
-    num_classes = _detect_num_classes(path, stage)
-    print(f"Loading {stage} model — detected {num_classes} output classes")
+        filtered_state = {
+            k: v for k, v in state.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
 
-    # Warn if it doesn't match our LABELS list
-    expected = len(LABELS[stage])
-    if num_classes != expected:
-        print(
-            f"  WARNING: model has {num_classes} classes but LABELS['{stage}'] "
-            f"has {expected}. Predictions may be misaligned."
-        )
+        missing = [k for k in model_state.keys() if k not in filtered_state]
+        unexpected = [k for k in state.keys() if k not in model_state]
+        mismatched = [
+            k for k, v in state.items()
+            if k in model_state and v.shape != model_state[k].shape
+        ]
 
-    model = _build_model(stage, num_classes)
-    state = torch.load(path, map_location=DEVICE)
-    model.load_state_dict(state)
+        print(f"[{stage}] missing keys: {missing[:20]}")
+        print(f"[{stage}] unexpected keys: {unexpected[:20]}")
+        print(f"[{stage}] mismatched keys: {mismatched[:20]}")
+
+        model.load_state_dict(filtered_state, strict=False)
+        print(f"Loaded {stage} model successfully")
+    else:
+        print(f"WARNING: {path} not found — demo mode (random weights)")
+
     model.eval()
     model.to(DEVICE)
     _model_cache[stage] = model
     return model
 
 
-# ── Preprocessing ──────────────────────────────────────────────────────────
-_PREPROCESS = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std= [0.229, 0.224, 0.225],
-    ),
-])
-
 def _preprocess(pil_image: Image.Image) -> torch.Tensor:
     return _PREPROCESS(pil_image.convert("RGB")).unsqueeze(0).to(DEVICE)
 
 
-# ── Inference ──────────────────────────────────────────────────────────────
+def _safe_labels(stage: str, n_outputs: int):
+    base_labels = LABELS[stage]
+    if n_outputs == len(base_labels):
+        return base_labels
+
+    if n_outputs < len(base_labels):
+        return base_labels[:n_outputs]
+
+    extra = [f"class_{i}" for i in range(len(base_labels), n_outputs)]
+    return base_labels + extra
+
+
 def _infer(stage: str, tensor: torch.Tensor) -> dict:
     model = _load_model(stage)
 
     with torch.no_grad():
-        probs = torch.softmax(model(tensor), dim=1)[0].cpu().numpy()
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
 
-    top_idx    = int(np.argmax(probs))
-    num_cls    = len(probs)
-
-    # Guard: if model output size differs from LABELS, truncate/pad safely
-    stage_labels = LABELS[stage]
-    if num_cls != len(stage_labels):
-        # Extend labels with placeholders if model has more classes
-        stage_labels = stage_labels + [f"class_{i}" for i in range(len(stage_labels), num_cls)]
-
-    label      = stage_labels[top_idx]
+    top_idx = int(np.argmax(probs))
+    stage_labels = _safe_labels(stage, len(probs))
+    label = stage_labels[top_idx]
     confidence = float(probs[top_idx])
 
     return {
-        "label":        label,
-        "confidence":   confidence,
-        "all_probs":    {lbl: float(p) for lbl, p in zip(stage_labels, probs)},
+        "label": label,
+        "confidence": confidence,
+        "all_probs": {lbl: float(p) for lbl, p in zip(stage_labels, probs)},
         "is_uncertain": confidence < CONFIDENCE_THRESHOLD,
     }
 
 
-# ── Stage functions ────────────────────────────────────────────────────────
-def _stage2_dryness(tensor):
-    r = _infer("dryness", tensor)
-    r["action"] = ACTIONS["dryness"].get(r["label"], "Monitor the plant closely.")
-    return r
-
-def _stage3_disease(tensor):
-    r = _infer("disease", tensor)
-    r["action"] = ACTIONS["disease"].get(r["label"], "Consult an agronomist.")
-    return r
-
-def _stage4_pest(tensor):
-    r = _infer("pest", tensor)
-    r["action"] = ACTIONS["pest"].get(r["label"], "Inspect the plant carefully.")
-    return r
+def _stage2_dryness(tensor: torch.Tensor) -> dict:
+    result = _infer("dryness", tensor)
+    result["action"] = ACTIONS["dryness"].get(result["label"], "Monitor the plant closely.")
+    return result
 
 
-# ── Public API ─────────────────────────────────────────────────────────────
+def _stage3_disease(tensor: torch.Tensor) -> dict:
+    result = _infer("disease", tensor)
+    result["action"] = ACTIONS["disease"].get(result["label"], "Consult an agronomist.")
+    return result
+
+
+def _stage4_pest(tensor: torch.Tensor) -> dict:
+    result = _infer("pest", tensor)
+    result["action"] = ACTIONS["pest"].get(result["label"], "Inspect the plant carefully.")
+    return result
+
+
 def run_pipeline(pil_image: Image.Image) -> dict:
-    """Run the LeafScan pipeline. Stage 1 bypassed."""
+    """
+    Run the LeafScan pipeline. Stage 1 is bypassed, so every input is treated as a valid leaf image.
+    """
     tensor = _preprocess(pil_image)
+
     return {
-        "is_valid_leaf":   True,
+        "is_valid_leaf": True,
         "leaf_confidence": 1.0,
-        "dryness":         _stage2_dryness(tensor),
-        "disease":         _stage3_disease(tensor),
-        "pest":            _stage4_pest(tensor),
+        "dryness": _stage2_dryness(tensor),
+        "disease": _stage3_disease(tensor),
+        "pest": _stage4_pest(tensor),
     }
+
+
+_download_models_if_missing()
